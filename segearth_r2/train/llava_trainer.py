@@ -181,6 +181,15 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 
 class LLaVATrainer(Trainer):
+    def __init__(self, *args, train_sampler=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_sampler = train_sampler
+    
+    def _get_train_sampler(self):
+        """重写以支持自定义 sampler"""
+        if self.train_sampler is not None:
+            return self.train_sampler
+        return super()._get_train_sampler()
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
@@ -213,7 +222,7 @@ class LLaVATrainer(Trainer):
         if not hasattr(self,'history_loss_dict'):
             self.history_loss_dict = {}
         for name, value in outputs.items():
-            if 'loss' in name and name != 'loss':
+            if 'loss' in name and name != 'loss' and name != 'loss_attention':
                 if name not in self.history_loss_dict:
                     self.history_loss_dict[name] = value.item()
                 else:
@@ -255,7 +264,7 @@ class LLaVATrainer(Trainer):
             if isinstance(outputs, dict) and 'loss_dice' in outputs:
                 loss_dict = {}
                 for name,value in outputs.items():
-                    if 'loss' in name and name != 'loss':
+                    if 'loss' in name and name != 'loss' and name != 'loss_attention':
                         loss_value = value.item()
                         if loss_value == 0 and hasattr(self,'history_loss_dict'):
                             loss_value = self.history_loss_dict[name]

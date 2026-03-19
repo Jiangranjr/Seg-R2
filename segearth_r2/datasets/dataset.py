@@ -24,6 +24,8 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
+from segearth_r2.datasets.augmentation import get_train_augmentation, get_test_augmentation
+from segearth_r2.datasets.balanced_sampler import BalancedSampler
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -58,8 +60,25 @@ def preprocess_mask(mask, image_size):
     
     return processed_masks
 
-def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, max_size = 1024):
+def preprocess_image(image_path, pad_value=128.0, short_edge_length=1024, max_size=1024, 
+                     multiscale_range=None):
+    """
+    预处理图像，支持多尺度训练
+    
+    Args:
+        image_path: 图像路径
+        pad_value: 填充值
+        short_edge_length: 短边长度
+        max_size: 最大尺寸
+        multiscale_range: 多尺度范围，如(0.8, 1.2)，None表示不使用多尺度
+    """
     img = Image.open(image_path)
+    
+    # 多尺度训练：随机缩放短边长度
+    if multiscale_range is not None:
+        scale_factor = random.uniform(multiscale_range[0], multiscale_range[1])
+        short_edge_length = int(short_edge_length * scale_factor)
+        max_size = int(max_size * scale_factor)
     
     # ResizeShortestEdge
     w, h = img.size
@@ -79,16 +98,72 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
     
     # FixedSizeCrop
     img_np = np.array(img_resize_shot_edge)
-    if neww < 1024:
-        padding = ((0, 0), (0, 1024 - neww), (0, 0))
+    target_size = 1024
+    
+    # 计算需要的填充或裁剪
+    pad_right = max(0, target_size - neww)
+    pad_bottom = max(0, target_size - newh)
+    
+    if pad_right > 0 or pad_bottom > 0:
+        # 需要填充
+        img_padded = np.pad(
+            img_np,
+            ((0, pad_bottom), (0, pad_right), (0, 0)),
+            mode="constant",
+            constant_values=pad_value
+        )
     else:
-        padding = ((0, 1024 - newh), (0, 0), (0, 0))
-    img_padded = np.pad(
-        img_np,
-        padding,
-        mode="constant",
-        constant_values=pad_value
-    ) # (1024, 1024, 3)
+        # 图像已经大于或等于目标尺寸，裁剪中心区域
+        if newh > target_size or neww > target_size:
+            start_h = (newh - target_size) // 2
+            start_w = (neww - target_size) // 2
+            img_padded = img_np[start_h:start_h+target_size, start_w:start_w+target_size]
+        else:
+            img_padded = img_np
+    
+    return img_padded
+
+
+def preprocess_image_from_array(img_np, pad_value=128.0, short_edge_length=1024, max_size=1024, multiscale_range=None):
+    """从numpy数组预处理图像（用于数据增强后）"""
+    # 多尺度训练
+    if multiscale_range is not None:
+        scale_factor = random.uniform(multiscale_range[0], multiscale_range[1])
+        short_edge_length = int(short_edge_length * scale_factor)
+        max_size = int(max_size * scale_factor)
+    
+    h, w = img_np.shape[:2]
+    
+    # ResizeShortestEdge
+    size = short_edge_length * 1.0
+    scale = size / min(h, w)
+    if h < w:
+        newh, neww = int(size), int(scale * w)
+    else:
+        newh, neww = int(scale * h), int(size)
+    if max(newh, neww) > max_size:
+        scale = max_size * 1.0 / max(newh, neww)
+        newh = int(newh * scale)
+        neww = int(neww * scale)
+    
+    img_resize = cv2.resize(img_np, (neww, newh), interpolation=cv2.INTER_LINEAR)
+    
+    # FixedSizeCrop - 确保目标尺寸为1024x1024
+    target_size = 1024
+    pad_right = max(0, target_size - neww)
+    pad_bottom = max(0, target_size - newh)
+    
+    if pad_right > 0 or pad_bottom > 0:
+        img_padded = cv2.copyMakeBorder(img_resize, 0, pad_bottom, 0, pad_right, 
+                                        cv2.BORDER_CONSTANT, value=pad_value)
+    else:
+        # 如果图像已经大于目标尺寸，裁剪中心区域
+        if neww > target_size or newh > target_size:
+            start_h = (newh - target_size) // 2
+            start_w = (neww - target_size) // 2
+            img_padded = img_resize[start_h:start_h+target_size, start_w:start_w+target_size]
+        else:
+            img_padded = img_resize
     
     return img_padded
 
@@ -216,24 +291,81 @@ class LaSeRSDataset(RS_Base_Dataset):
 
         return token_refer_id
     
-    def __init__(self, base_data_path, tokenizer, data_args, split='train_data.json'):
+    def __init__(self, base_data_path, tokenizer, data_args, split='train_data.json', 
+                 use_augmentation=False, use_multiscale=False, multiscale_range=(0.8, 1.2),
+                 analyze_small_objects=False):
+        """
+        Args:
+            base_data_path: 数据路径
+            tokenizer: 分词器
+            data_args: 数据参数
+            split: 数据集划分
+            use_augmentation: 是否使用数据增强
+            use_multiscale: 是否使用多尺度训练
+            multiscale_range: 多尺度范围，如(0.8, 1.2)
+            analyze_small_objects: 是否分析小目标用于后续过采样
+        """
         self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)   
         self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
         
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
+        self.use_augmentation = use_augmentation
+        self.use_multiscale = use_multiscale
+        self.multiscale_range = multiscale_range
+        self.analyze_small_objects = analyze_small_objects
+        
         if "train" in split:
             self.LaSeRS_image_path = os.path.join(base_data_path, "train/images")
             self.LaSeRS_json_path = os.path.join(base_data_path, "train/annotations", split)
+            # 训练时根据配置决定是否启用数据增强
+            if self.use_augmentation:
+                self.augmentation = get_train_augmentation()
+                print("[Dataset] 训练数据增强已启用")
+            else:
+                self.augmentation = None
+            if self.use_multiscale:
+                print(f"[Dataset] 多尺度训练已启用，范围: {multiscale_range}")
         elif "test" in split:
             self.LaSeRS_image_path = os.path.join(base_data_path, "test/images")
             self.LaSeRS_json_path = os.path.join(base_data_path, "test/annotations", split)
+            self.augmentation = None  # 测试时不使用增强
 
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
         
         with open(self.LaSeRS_json_path, "r") as f:
             data = json.load(f)
         self.reason_file = data
+        
+        # 分析小目标（用于过采样）
+        self.mask_areas = None
+        if self.analyze_small_objects:
+            self.mask_areas = self._analyze_mask_areas()
+    
+    def _analyze_mask_areas(self):
+        """分析所有样本的mask面积，用于小目标检测"""
+        print("[Dataset] 分析小目标面积...")
+        areas = []
+        for data_info in self.reason_file:
+            if "mask" in data_info:
+                rle_list = data_info['mask']
+                total_area = 0
+                for rle in rle_list:
+                    mask = M.decode(rle)
+                    total_area += mask.sum()
+                areas.append(total_area)
+            else:
+                areas.append(0)
+        
+        areas = np.array(areas)
+        small_threshold = 1000  # 小目标阈值
+        num_small = (areas < small_threshold).sum()
+        print(f"[Dataset] 小目标样本 (<{small_threshold}px): {num_small}/{len(areas)} ({num_small/len(areas)*100:.1f}%)")
+        return areas
+    
+    def get_mask_areas(self):
+        """返回mask面积列表，用于过采样器"""
+        return self.mask_areas
     
     def __len__(self):
         return len(self.reason_file)
@@ -264,9 +396,38 @@ class LaSeRSDataset(RS_Base_Dataset):
         data_dict['width'] = image_width
         data_dict['image_id'] = idx
         
+        # ========================================
+        # 应用数据增强（仅在训练时且启用增强时）
+        # ========================================
+        if self.augmentation is not None and masks is not None:
+            # BGR转RGB
+            image_RGB_raw = cv2.cvtColor(image_BGR, cv2.COLOR_BGR2RGB)
+            # 应用数据增强
+            # masks 形状: (num_masks, H, W)，augmentation模块已支持处理
+            image_aug, mask_aug = self.augmentation(image_RGB_raw, masks)
+            # 转换回BGR用于后续处理
+            image_BGR = cv2.cvtColor(image_aug, cv2.COLOR_RGB2BGR)
+            # 恢复mask格式为列表
+            if mask_aug.ndim == 2:
+                # 单个mask
+                masks = [mask_aug]
+            else:
+                # 多个mask: (N, H, W) -> list of (H, W)
+                masks = [mask_aug[i] for i in range(mask_aug.shape[0])]
+        
         # process image
         # ResizeShortestEdge + FixedSizeCrop
-        image_RGB = preprocess_image(image_path)
+        # 注意：augmentation后的图像直接处理，不需要再读文件
+        
+        # 确定是否使用多尺度
+        multiscale_range = self.multiscale_range if self.use_multiscale else None
+        
+        if self.augmentation is not None:
+            # 如果有增强，直接使用增强后的BGR图像进行预处理
+            image_RGB = preprocess_image_from_array(image_BGR, multiscale_range=multiscale_range)
+        else:
+            # 多尺度训练：传递 multiscale_range 参数
+            image_RGB = preprocess_image(image_path, multiscale_range=multiscale_range)
         image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
         data_dict['image'] = (image_tensor - self.pixel_mean) / self.pixel_std
         

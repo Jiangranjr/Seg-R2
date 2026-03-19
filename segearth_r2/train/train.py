@@ -40,6 +40,8 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    
+
 
 @dataclass
 class DataArguments:
@@ -52,6 +54,13 @@ class DataArguments:
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
     segmentation: bool = True
+    use_augmentation: bool = False  # 是否启用数据增强
+    use_multiscale: bool = False  # 是否启用多尺度训练
+    multiscale_range_min: float = 0.8  # 多尺度最小缩放
+    multiscale_range_max: float = 1.2  # 多尺度最大缩放
+    use_oversample: bool = False  # 是否启用小目标过采样
+    oversample_threshold: int = 1000  # 小目标阈值（像素）
+    oversample_ratio: float = 2.0  # 过采样比例
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -182,19 +191,53 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_args):
+    from torch.utils.data import DataLoader
+    from segearth_r2.datasets.balanced_sampler import BalancedSampler
+    
     data_ratio = data_args.data_ratio
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     datasets = []
+    samplers = []
+    
     if data_ratio[0] != 0:
-        LaSeRSTrainDataset = LaSeRSDataset(base_data_path=data_args.base_data_path, tokenizer=tokenizer, data_args=data_args)
+        # 构建多尺度范围
+        multiscale_range = (data_args.multiscale_range_min, data_args.multiscale_range_max) if data_args.use_multiscale else None
+        
+        LaSeRSTrainDataset = LaSeRSDataset(
+            base_data_path=data_args.base_data_path, 
+            tokenizer=tokenizer, 
+            data_args=data_args,
+            use_augmentation=data_args.use_augmentation,  # 传入数据增强参数
+            use_multiscale=data_args.use_multiscale,  # 多尺度训练
+            multiscale_range=multiscale_range,
+            analyze_small_objects=data_args.use_oversample  # 分析小目标用于过采样
+        )
         datasets += [LaSeRSTrainDataset] * data_ratio[0]
+        
+        # 小目标过采样
+        if data_args.use_oversample:
+            mask_areas = LaSeRSTrainDataset.get_mask_areas()
+            if mask_areas is not None:
+                sampler = BalancedSampler(
+                    LaSeRSTrainDataset, 
+                    mask_areas,
+                    oversample_threshold=data_args.oversample_threshold,
+                    oversample_ratio=data_args.oversample_ratio
+                )
+                samplers.append(sampler)
+                print(f"[DataModule] 小目标过采样已启用，阈值: {data_args.oversample_threshold}")
     
     print(f'the dataset ratio is: {data_ratio}')
     train_dataset = UnifyDatasetSingleDatasetForBatch(datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len)
     print(f'total unify datasest number is {len(train_dataset)}')
     data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    
+    result = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    if samplers:
+        result['sampler'] = samplers[0]  # 使用过采样器
+    
+    return result
 
 def train():
     global local_rank
@@ -214,11 +257,13 @@ def train():
         add_cross_attn=True,
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
-                )
+    )
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+
+
 
     model.config.use_cache = False
 
@@ -320,9 +365,13 @@ def train():
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
     
+    # 提取 sampler（如果存在）
+    train_sampler = data_module.pop('sampler', None)
+    
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
+                           train_sampler=train_sampler,
                            **data_module)
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

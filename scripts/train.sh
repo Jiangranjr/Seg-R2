@@ -3,11 +3,11 @@ export NCCL_IB_DISABLE="1"
 
 # ------ main-training ------
 # 显存不足时可选择zero3.json或者zero2.json
-deepspeed --master_port=29500 --include localhost:4 segearth_r2/train/train.py \
-    --model_name_or_path "pretrained_model/mllm/Mipha-3B" \
-    --vision_tower "pretrained_model/CLIP/siglip-so400m-patch14-384" \
-    --vision_tower_mask "pretrained_model/mask2former/model_final_54b88a.pkl" \
-    --base_data_path '/data1/xzp/data' \
+deepspeed --master_port=29500 --include localhost:4 /home/jiangran/SegEarth-R2/SegEarth-R2/segearth_r2/train/train.py \
+    --model_name_or_path "/home/jiangran/SegEarth-R2/pretrained_model/mllm/Mipha-3B" \
+    --vision_tower "/home/jiangran/SegEarth-R2/pretrained_model/CLIP/siglip-so400m-patch14-384" \
+    --vision_tower_mask "/home/jiangran/SegEarth-R2/pretrained_model/mask2former/model_final_54b88a.pkl" \
+    --base_data_path '/home/jiangran/SegEarth-R2/data_path' \
     --output_dir output_folder \
     --max_steps 5000 \
     --per_device_train_batch_size 1 \
@@ -25,7 +25,7 @@ deepspeed --master_port=29500 --include localhost:4 segearth_r2/train/train.py \
     --gradient_checkpointing False \
     --dataloader_num_workers 8 \
     --lora_r 4 \
-    --deepspeed scripts/zero3.json \
-    --mask_config 'segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml' \
+    --deepspeed /home/jiangran/SegEarth-R2/SegEarth-R2/scripts/zero3.json \
+    --mask_config '/home/jiangran/SegEarth-R2/SegEarth-R2/segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml' \
     --data_ratio '1' \
-    --switch_bs 4 \
+    --switch_bs 4 

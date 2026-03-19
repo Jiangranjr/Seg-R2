@@ -27,7 +27,8 @@ import sys
 import math
 import itertools
 from PIL import Image
-import wandb
+# import wandb
+import swanlab
 
 from modeling.MaskFormerModel import MaskFormerModel
 from utils.criterion import SetCriterion, Criterion
@@ -63,11 +64,11 @@ class MaskFormer():
         self._training_init(cfg)
 
         run_name = datetime.datetime.now().strftime("swin-%Y-%m-%d-%H-%M")
-        self.run = wandb.init(
+        self.run = swanlab.init(
             project=cfg.project_name,
             name=run_name
         )
-        wandb.watch(self.model)
+        swanlab.watch(self.model)
 
     def build_optimizer(self):
         def maybe_add_full_model_gradient_clipping(optim):
@@ -172,10 +173,10 @@ class MaskFormer():
             evaluator_samples = self.evaluate_sample()
             self.scheduler.step(evaluator_score)
             # self.summary_writer.add_scalar('val_dice_score', evaluator_score, epoch)
-            wandb.log({
+            swanlab.log({
                     "evaluator_score": evaluator_score,
                     "train_loss": train_loss,
-                    "samples": [wandb.Image(sample) for sample in evaluator_samples],
+                    "samples": [swanlab.Image(sample) for sample in evaluator_samples],
                 })
             if evaluator_score > max_score:
                 max_score = evaluator_score

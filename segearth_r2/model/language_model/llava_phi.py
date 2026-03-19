@@ -25,6 +25,12 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_e
 
 from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
+from segearth_r2.model.multi_cate_enhancement import (
+    MultiMaskConsistencyLoss, CrossMaskAttentionModule, DEFAULT_MULTICATE_CONFIG
+)
+from segearth_r2.utils.bbox_utils import (
+    masks_to_bboxes, BBoxLoss, ProgressiveBBoxWeight
+)
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
@@ -39,6 +45,8 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_consistency: Optional[torch.FloatTensor] = None
+    loss_bbox: Optional[torch.FloatTensor] = None  # BBox 损失
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -67,6 +75,7 @@ class AttentionLoss(nn.Module):
         elif self.reduction == 'mean':
             loss = loss / model_attention_logits.numel()  # Overall mean loss
         return loss
+
 
 class SegEarthR2Model(MiphaPhiModel):
 
@@ -144,6 +153,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         self.attention_loss = AttentionLoss()
         
+        # BBox 损失 - 用于渐进式训练
+        print('Initializing BBox Loss for Progressive Training...')
+        self.bbox_loss_fn = BBoxLoss(l1_weight=5.0, giou_weight=2.0)
+        self.bbox_weight_scheduler = ProgressiveBBoxWeight(
+            stage1_end=2000,
+            stage2_end=5000,
+            weight_stage1=2.0,
+            weight_stage2=0.5,
+            weight_stage3=0.1
+        )
+        self.training_step_counter = 0  # 训练步数计数器
+        
+        # 多类别分割增强模块
+        self.use_multicate_enhancement = True
+        if self.use_multicate_enhancement:
+            print('Initializing Multi-Category Enhancement Modules...')
+            self.multi_mask_consistency_loss = MultiMaskConsistencyLoss(
+                min_area_ratio=0.01,
+                max_area_ratio=0.8,
+                overlap_penalty=0.1
+            )
+            self.cross_mask_attention = CrossMaskAttentionModule(
+                hidden_dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+                num_heads=8
+            )
+        
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape)
@@ -178,8 +213,34 @@ class SegEarthR2(MiphaPhiForCausalLM):
             change_w(pixel_decoder_weights,'layer_1.norm.bias','layer_1.1.bias')
             if 'static_query.weight' in predictor_weights:
                 change_w(predictor_weights,'static_query.weight','query_feat.weight')
-            if predictor_weights['query_embed.weight'].shape[0] == 200:
-                predictor_weights['query_embed.weight'] = predictor_weights['query_embed.weight'][:100,:]
+            
+            # 处理 query 数量不匹配的情况（预训练100 vs 当前200）
+            current_num_queries = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
+            pretrained_num_queries = predictor_weights['query_embed.weight'].shape[0]
+            
+            if pretrained_num_queries != current_num_queries:
+                print(f"[Weight Loading] Query数量不匹配: 预训练={pretrained_num_queries}, 当前={current_num_queries}")
+                
+                if pretrained_num_queries < current_num_queries:
+                    # 预训练权重较少，复制填充到当前数量
+                    print(f"[Weight Loading] 复制预训练query权重从{pretrained_num_queries}到{current_num_queries}")
+                    
+                    # 复制 query_feat
+                    old_query_feat = predictor_weights['query_feat.weight']
+                    new_query_feat = old_query_feat.repeat((current_num_queries // pretrained_num_queries) + 1, 1)[:current_num_queries]
+                    predictor_weights['query_feat.weight'] = new_query_feat
+                    
+                    # 复制 query_embed
+                    old_query_embed = predictor_weights['query_embed.weight']
+                    new_query_embed = old_query_embed.repeat((current_num_queries // pretrained_num_queries) + 1, 1)[:current_num_queries]
+                    predictor_weights['query_embed.weight'] = new_query_embed
+                    
+                elif pretrained_num_queries > current_num_queries:
+                    # 预训练权重较多，裁剪到当前数量
+                    print(f"[Weight Loading] 裁剪预训练query权重从{pretrained_num_queries}到{current_num_queries}")
+                    predictor_weights['query_feat.weight'] = predictor_weights['query_feat.weight'][:current_num_queries]
+                    predictor_weights['query_embed.weight'] = predictor_weights['query_embed.weight'][:current_num_queries]
+            
             diff_pixel_msg = self.pixel_decoder.load_state_dict(pixel_decoder_weights,strict=False)
             diff_predictor_msg = self.predictor.load_state_dict(predictor_weights,strict=False)
             print(diff_predictor_msg)
@@ -224,13 +285,20 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
         losses = ["SEG_labels", "masks",]
+        # 保存基础权重供动态调整使用
+        self.base_weight_dict = {
+            'mask': mask_weight,
+            'dice': dice_weight,
+            'class': class_weight
+        }
+        
         self.criterion = Criterion(
             matcher=matcher,
             losses=losses,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            device=self.device
+            device=next(self.parameters()).device
         )
         self.size_divisibility = 32
         self.sem_seg_postprocess_before_inference = True
@@ -627,7 +695,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_dataset_type = dataset_type[0]
         else:
             batch_dataset_type = []
-        output_attentions = True
+        # 检查是否启用了gradient_checkpointing，如果启用则无法获取attentions
+        if hasattr(self, 'config') and hasattr(self.config, 'gradient_checkpointing'):
+            use_gc = self.config.gradient_checkpointing
+        else:
+            use_gc = False
+        
+        # 只有在没有启用gradient_checkpointing时才计算attention loss
+        output_attentions = not use_gc
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -656,15 +731,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        # Handle case when gradient_checkpointing is enabled (outputs.attentions is None)
+        if outputs.attentions is not None:
+            attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        else:
+            attentions = []
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        
+        # 多类别增强：跨mask注意力机制
+        if self.use_multicate_enhancement and SEG_embedding.shape[0] > 1:
+            SEG_embedding = self.cross_mask_attention(SEG_embedding)
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
+        
+        mask_num_tensor = torch.tensor(mask_num, device=mask_features.device)
+        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_tensor, dim=0)
         multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
+            torch.repeat_interleave(feat, repeats=mask_num_tensor, dim=0)
             for feat in multi_scale_features
         ]
 
@@ -752,19 +836,76 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 batch_attentions_list.append(attention)
             batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
             loss_attention += self.attention_loss(batch_attentions, masks_down)
-                             
-        loss = llm_loss + mask_loss + 0.01 * loss_attention
-
+        
+        # 多类别增强：多mask一致性损失
+        loss_consistency = torch.tensor(0.0, device=mask_loss.device)
+        if self.use_multicate_enhancement and mask_loss is not None and mask_num is not None:
+            # 按样本分组计算一致性损失
+            pred_masks = mask_outputs['pred_masks']  # [total_masks, 1, H, W]
+            start_idx = 0
+            bs = len(mask_num)
+            for num in mask_num:
+                if num > 1:  # 只有多个mask时才计算一致性
+                    sample_masks = pred_masks[start_idx:start_idx+num]
+                    loss_consistency += self.multi_mask_consistency_loss(
+                        torch.sigmoid(sample_masks)
+                    )
+                start_idx += num
+            loss_consistency = loss_consistency / bs  # 归一化
+        
+        # ========== 渐进式 BBox 监督 ==========
+        loss_bbox = torch.tensor(0.0, device=mask_loss.device)
+        if seg_info is not None and mask_outputs is not None and targets is not None:
+            # 从预测的 mask 提取 bbox
+            with torch.no_grad():
+                pred_masks_sigmoid = torch.sigmoid(mask_outputs['pred_masks'])
+            pred_bboxes = masks_to_bboxes(pred_masks_sigmoid, threshold=0.5)
+            
+            # 从 GT masks 提取 bbox
+            gt_masks_list = []
+            for target in targets:
+                if 'masks' in target and target['masks'] is not None:
+                    gt_masks_list.append(target['masks'])
+            
+            if gt_masks_list and len(gt_masks_list) > 0:
+                try:
+                    gt_masks_tensor = torch.cat(gt_masks_list, dim=0)  # [N, H, W]
+                    gt_bboxes = masks_to_bboxes(gt_masks_tensor, threshold=0.5)
+                    
+                    # 确保数量匹配
+                    if pred_bboxes.shape[0] == gt_bboxes.shape[0]:
+                        loss_bbox = self.bbox_loss_fn(pred_bboxes, gt_bboxes)
+                except Exception as e:
+                    # 如果 bbox 计算失败，跳过（不影响主要训练）
+                    pass
+        
+        # 获取当前 bbox 权重（渐进式）
+        bbox_weight = self.bbox_weight_scheduler.get_weight(self.training_step_counter)
+        
+        # 总损失
+        loss = (0.5 * llm_loss + # 权重原始为1
+                loss_mask +     # 权重原始为1
+                loss_dice + 
+                0.05 * loss_attention + # 权重原始为0.01
+                0.2 * loss_consistency + # 权重原始为0.1
+                bbox_weight * loss_bbox)
+        
+        # 更新训练步数
+        if self.training:
+            self.training_step_counter += 1
+        
         return CausalOutputWithMask(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            loss_mask=loss_mask.detach(),
-            loss_dice=loss_dice.detach(),
-            loss_llm=llm_loss.detach(),
-            loss_attention=0.01 * loss_attention.detach(),
+            loss_mask=loss_mask.detach() if loss_mask is not None else None,
+            loss_dice=loss_dice.detach() if loss_dice is not None else None,
+            loss_bbox=bbox_weight * loss_bbox.detach() if loss_bbox is not None else None,
+            loss_llm=0.5 * llm_loss.detach() if llm_loss is not None else None,
+            loss_attention=0.05 * loss_attention.detach() if loss_attention is not None else None,
+            loss_consistency=0.2 * loss_consistency.detach() if loss_consistency is not None else None,
         )
     
     def eval_seg(
@@ -812,7 +953,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
-    
+        
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
         mask_num = torch.tensor(mask_num, device=mask_features.device)
@@ -823,9 +964,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
         ]
 
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
-
         
         mask_pred_results = mask_outputs["pred_masks"]
+        
         images = ImageList.from_tensors(images, self.size_divisibility)
         mask_pred_results = F.interpolate(
             mask_pred_results,

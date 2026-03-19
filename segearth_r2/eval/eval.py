@@ -35,8 +35,8 @@ class DataArguments:
 
     local_rank: int = 0 
 
-    vision_tower: str = "pretrained_model/CLIP/siglip-so400m-patch14-384"
-    vision_tower_mask: str = "pretrained_model/mask2former/model_final_54b88a.pkl"
+    vision_tower: str = "/home/jiangran/SegEarth-R2/pretrained_model/CLIP/siglip-so400m-patch14-384"
+    vision_tower_mask: str = "/home/jiangran/SegEarth-R2/pretrained_model/mask2former/model_final_54b88a.pkl"
 
     lazy_preprocess: bool = False
     base_data_path: Optional[str] = field(default='your_data_path')
